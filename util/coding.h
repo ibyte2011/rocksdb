@@ -7,8 +7,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 //
-// Endian-neutral encoding:
+// Encoding independent of machine byte order:
 // * Fixed-length numbers are encoded with least-significant byte first
+//   (little endian, native order on Intel and others)
 // * In addition we support variable length "varint" encoding
 // * Strings are encoded prefixed by their length in varint format
 
@@ -26,7 +27,7 @@
   #define PLATFORM_UNALIGNED_ACCESS_NOT_ALLOWED
 #endif
 
-namespace rocksdb {
+namespace ROCKSDB_NAMESPACE {
 
 // The maximum length of a varint in bytes for 64-bit.
 const unsigned int kMaxVarint64Length = 10;
@@ -50,6 +51,8 @@ extern void PutVarint32Varint32Varint64(std::string* dst, uint32_t value1,
 extern void PutLengthPrefixedSlice(std::string* dst, const Slice& value);
 extern void PutLengthPrefixedSliceParts(std::string* dst,
                                         const SliceParts& slice_parts);
+extern void PutLengthPrefixedSlicePartsWithPadding(
+    std::string* dst, const SliceParts& slice_parts, size_t pad_sz);
 
 // Standard Get... routines parse a value from the beginning of a Slice
 // and advance the slice past the parsed value.
@@ -58,13 +61,15 @@ extern bool GetFixed32(Slice* input, uint32_t* value);
 extern bool GetFixed16(Slice* input, uint16_t* value);
 extern bool GetVarint32(Slice* input, uint32_t* value);
 extern bool GetVarint64(Slice* input, uint64_t* value);
+extern bool GetVarsignedint64(Slice* input, int64_t* value);
 extern bool GetLengthPrefixedSlice(Slice* input, Slice* result);
 // This function assumes data is well-formed.
 extern Slice GetLengthPrefixedSlice(const char* data);
 
 extern Slice GetSliceUntil(Slice* slice, char delimiter);
 
-// Borrowed from https://github.com/facebook/fbthrift/blob/449a5f77f9f9bae72c9eb5e78093247eef185c04/thrift/lib/cpp/util/VarintUtils-inl.h#L202-L208
+// Borrowed from
+// https://github.com/facebook/fbthrift/blob/449a5f77f9f9bae72c9eb5e78093247eef185c04/thrift/lib/cpp/util/VarintUtils-inl.h#L202-L208
 constexpr inline uint64_t i64ToZigzag(const int64_t l) {
   return (static_cast<uint64_t>(l) << 1) ^ static_cast<uint64_t>(l >> 63);
 }
@@ -304,9 +309,8 @@ inline void PutLengthPrefixedSlice(std::string* dst, const Slice& value) {
   dst->append(value.data(), value.size());
 }
 
-inline void PutLengthPrefixedSliceParts(std::string* dst,
+inline void PutLengthPrefixedSliceParts(std::string* dst, size_t total_bytes,
                                         const SliceParts& slice_parts) {
-  size_t total_bytes = 0;
   for (int i = 0; i < slice_parts.num_parts; ++i) {
     total_bytes += slice_parts.parts[i].size();
   }
@@ -314,6 +318,17 @@ inline void PutLengthPrefixedSliceParts(std::string* dst,
   for (int i = 0; i < slice_parts.num_parts; ++i) {
     dst->append(slice_parts.parts[i].data(), slice_parts.parts[i].size());
   }
+}
+
+inline void PutLengthPrefixedSliceParts(std::string* dst,
+                                        const SliceParts& slice_parts) {
+  PutLengthPrefixedSliceParts(dst, /*total_bytes=*/0, slice_parts);
+}
+
+inline void PutLengthPrefixedSlicePartsWithPadding(
+    std::string* dst, const SliceParts& slice_parts, size_t pad_sz) {
+  PutLengthPrefixedSliceParts(dst, /*total_bytes=*/pad_sz, slice_parts);
+  dst->append(pad_sz, '\0');
 }
 
 inline int VarintLength(uint64_t v) {
@@ -376,13 +391,46 @@ inline bool GetVarint64(Slice* input, uint64_t* value) {
   }
 }
 
-// Provide an interface for platform independent endianness transformation
-inline uint64_t EndianTransform(uint64_t input, size_t size) {
-  char* pos = reinterpret_cast<char*>(&input);
-  uint64_t ret_val = 0;
-  for (size_t i = 0; i < size; ++i) {
-    ret_val |= (static_cast<uint64_t>(static_cast<unsigned char>(pos[i]))
-                << ((size - i - 1) << 3));
+inline bool GetVarsignedint64(Slice* input, int64_t* value) {
+  const char* p = input->data();
+  const char* limit = p + input->size();
+  const char* q = GetVarsignedint64Ptr(p, limit, value);
+  if (q == nullptr) {
+    return false;
+  } else {
+    *input = Slice(q, static_cast<size_t>(limit - q));
+    return true;
+  }
+}
+
+// Swaps between big and little endian. Can be used to in combination
+// with the little-endian encoding/decoding functions to encode/decode
+// big endian.
+template <typename T>
+inline T EndianSwapValue(T v) {
+  static_assert(std::is_integral<T>::value, "non-integral type");
+
+#ifdef _MSC_VER
+  if (sizeof(T) == 2) {
+    return static_cast<T>(_byteswap_ushort(static_cast<uint16_t>(v)));
+  } else if (sizeof(T) == 4) {
+    return static_cast<T>(_byteswap_ulong(static_cast<uint32_t>(v)));
+  } else if (sizeof(T) == 8) {
+    return static_cast<T>(_byteswap_uint64(static_cast<uint64_t>(v)));
+  }
+#else
+  if (sizeof(T) == 2) {
+    return static_cast<T>(__builtin_bswap16(static_cast<uint16_t>(v)));
+  } else if (sizeof(T) == 4) {
+    return static_cast<T>(__builtin_bswap32(static_cast<uint32_t>(v)));
+  } else if (sizeof(T) == 8) {
+    return static_cast<T>(__builtin_bswap64(static_cast<uint64_t>(v)));
+  }
+#endif
+  // Recognized by clang as bswap, but not by gcc :(
+  T ret_val = 0;
+  for (size_t i = 0; i < sizeof(T); ++i) {
+    ret_val |= ((v >> (8 * i)) & 0xff) << (8 * (sizeof(T) - 1 - i));
   }
   return ret_val;
 }
@@ -451,4 +499,4 @@ inline void GetUnaligned(const T *memory, T *value) {
 #endif
 }
 
-}  // namespace rocksdb
+}  // namespace ROCKSDB_NAMESPACE
